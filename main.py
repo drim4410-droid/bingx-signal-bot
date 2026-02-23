@@ -6,67 +6,168 @@ import requests
 import numpy as np
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.client.default import DefaultBotProperties
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 # ==========================
-# CONFIG
+# CONFIG / DEFAULTS
 # ==========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var not set")
 
-# Владелец (кому бот будет слать авто-сигналы)
-# Можно НЕ задавать, тогда владелец назначается командой /setme
 OWNER_ID_ENV = os.getenv("OWNER_ID")  # optional
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
+DEFAULT_OWNER_ID: int | None = int(OWNER_ID_ENV) if OWNER_ID_ENV and OWNER_ID_ENV.isdigit() else None
 
 BINGX_BASE = "https://open-api.bingx.com"
 HTTP_TIMEOUT = 12
 
-# PRO A settings
-SCAN_INTERVAL_SEC = 5 * 60       # скан каждые 5 минут
-UPDATE_INTERVAL_SEC = 60         # обновление активных сигналов каждую минуту
-MAX_ACTIVE_SIGNALS = 2           # чтобы не было спама
-NO_REPEAT_SEC = 6 * 60 * 60      # не повторяем тикер 6 часов
-
-# liquidity & performance
-TOP_N_TARGET = 200               # хотим держать топ-200
-ROTATION_BATCH = 200             # сколько символов реально проверять за цикл (равно TOP_N_TARGET)
-MAX_CONCURRENT_REQUESTS = 10     # чтобы Railway не сдох и не словить лимиты
+MAX_CONCURRENT_REQUESTS = 10
 SEM = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# thresholds (строго)
-MIN_SCORE = 90.0
-MIN_VOL_SPIKE = 1.30
-RSI_LONG_MIN, RSI_LONG_MAX = 52.0, 65.0
-RSI_SHORT_MIN, RSI_SHORT_MAX = 35.0, 48.0
+NO_REPEAT_SEC = 6 * 60 * 60  # 6h cooldown per symbol
 
-# ATR risk model
-SL_ATR_MULT = 1.35               # balanced/strict
+TOP_N_TARGET = 200
+ROTATION_BATCH = 200
+
+# Risk model defaults
+SL_ATR_MULT_DEFAULT = 1.35
 TP1_R = 1.0
-TP2_R = 2.5                      # PRO A: минимум 2.5R до TP2
-TP3_R = 4.0                      # добивка
+TP2_R_DEFAULT = 2.5
+TP3_R = 4.0
+
+# Strict filters defaults (PRO A)
+MIN_SCORE_DEFAULT = 90.0
+MIN_VOL_SPIKE_DEFAULT = 1.30
+
+RSI_LONG_MIN_DEFAULT, RSI_LONG_MAX_DEFAULT = 52.0, 65.0
+RSI_SHORT_MIN_DEFAULT, RSI_SHORT_MAX_DEFAULT = 35.0, 48.0
+
+SCAN_INTERVAL_SEC_DEFAULT = 5 * 60
+UPDATE_INTERVAL_SEC = 60
+
+MAX_ACTIVE_SIGNALS_DEFAULT = 2
+
+# MTF presets
+MTF_PRESETS = {
+    "proA": {"htf": "4h", "mid": "1h", "ltf": "15m"},
+    "fast": {"htf": "1h", "mid": "15m", "ltf": "5m"},
+}
+
+
+# ==========================
+# BOT INIT
+# ==========================
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
 
 # ==========================
 # STATE (in-memory)
 # ==========================
-OWNER_ID: int | None = int(OWNER_ID_ENV) if OWNER_ID_ENV and OWNER_ID_ENV.isdigit() else None
+OWNER_ID: int | None = DEFAULT_OWNER_ID
 
-# активные сигналы: key = (symbol, direction)
 ACTIVE_SIGNALS: dict[str, dict] = {}
-
-# чтобы не повторять тикер часто
 LAST_SENT_AT: dict[str, float] = {}
 
-# простая оценка ликвидности (обновляется по объёму 15m свечей)
 LIQ_SCORE: dict[str, float] = {}
-LAST_LIQ_REFRESH = 0.0
+
+# User settings: keyed by owner_id
+USER_CFG: dict[int, dict] = {}
+
+def cfg_get(owner_id: int) -> dict:
+    """Get config for owner with defaults."""
+    if owner_id not in USER_CFG:
+        USER_CFG[owner_id] = {
+            "scan_interval_sec": SCAN_INTERVAL_SEC_DEFAULT,
+            "max_active": MAX_ACTIVE_SIGNALS_DEFAULT,
+            "min_score": MIN_SCORE_DEFAULT,
+            "min_vol_spike": MIN_VOL_SPIKE_DEFAULT,
+            "rsi_long_min": RSI_LONG_MIN_DEFAULT,
+            "rsi_long_max": RSI_LONG_MAX_DEFAULT,
+            "rsi_short_min": RSI_SHORT_MIN_DEFAULT,
+            "rsi_short_max": RSI_SHORT_MAX_DEFAULT,
+            "sl_atr_mult": SL_ATR_MULT_DEFAULT,
+            "tp2_r": TP2_R_DEFAULT,
+            "mtf": "proA",  # preset key
+            "strictness": "PRO_A",  # ULTRA / PRO_A / SOFT
+        }
+    return USER_CFG[owner_id]
+
+def now() -> float:
+    return time.time()
+
+def should_skip_repeat(symbol: str) -> bool:
+    last = LAST_SENT_AT.get(symbol, 0.0)
+    return (now() - last) < NO_REPEAT_SEC
+
 
 # ==========================
-# HTTP + BINGX
+# UI (Buttons)
+# ==========================
+def kb_main():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👑 Назначить меня владельцем", callback_data="set_owner")
+    kb.button(text="⚡ Сканировать сейчас", callback_data="force_scan")
+    kb.button(text="📌 Активные сигналы", callback_data="show_active")
+    kb.button(text="⚙️ Настройки PRO", callback_data="settings")
+    kb.button(text="✅ Тест BingX", callback_data="bingx_test")
+    kb.adjust(1, 2, 2)
+    return kb.as_markup()
+
+def kb_settings(owner_id: int):
+    c = cfg_get(owner_id)
+    kb = InlineKeyboardBuilder()
+
+    kb.button(text=f"⏱ Частота скана: {int(c['scan_interval_sec']/60)}м", callback_data="set_scan_interval")
+    kb.button(text=f"📌 Макс активных: {c['max_active']}", callback_data="set_max_active")
+
+    kb.button(text=f"🎯 Строгость: {c['strictness']}", callback_data="set_strictness")
+    kb.button(text=f"🧠 MTF: {c['mtf']} ({MTF_PRESETS[c['mtf']]['htf']}+{MTF_PRESETS[c['mtf']]['mid']}+{MTF_PRESETS[c['mtf']]['ltf']})", callback_data="set_mtf")
+
+    kb.button(text="⬅️ Назад", callback_data="back_main")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+def kb_pick_scan_interval():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="3 мин", callback_data="scanint:180")
+    kb.button(text="5 мин", callback_data="scanint:300")
+    kb.button(text="10 мин", callback_data="scanint:600")
+    kb.button(text="⬅️ Назад", callback_data="settings")
+    kb.adjust(3, 1)
+    return kb.as_markup()
+
+def kb_pick_max_active():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="1", callback_data="maxact:1")
+    kb.button(text="2", callback_data="maxact:2")
+    kb.button(text="3", callback_data="maxact:3")
+    kb.button(text="⬅️ Назад", callback_data="settings")
+    kb.adjust(3, 1)
+    return kb.as_markup()
+
+def kb_pick_strictness():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔥 ULTRA (очень редко)", callback_data="strict:ULTRA")
+    kb.button(text="✅ PRO_A (рекоменд)", callback_data="strict:PRO_A")
+    kb.button(text="🟡 SOFT (чуть чаще)", callback_data="strict:SOFT")
+    kb.button(text="⬅️ Назад", callback_data="settings")
+    kb.adjust(1, 1, 1, 1)
+    return kb.as_markup()
+
+def kb_pick_mtf():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="PRO A: 4H+1H+15m", callback_data="mtf:proA")
+    kb.button(text="FAST: 1H+15m+5m", callback_data="mtf:fast")
+    kb.button(text="⬅️ Назад", callback_data="settings")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+# ==========================
+# BingX API (Public)
 # ==========================
 def _http_get(url: str, params: dict | None = None) -> dict:
     r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
@@ -83,7 +184,6 @@ def bingx_get_usdt_perpetuals() -> list[str]:
         sym = item.get("symbol")
         if sym and (quote == "USDT" or (isinstance(sym, str) and sym.endswith("USDT"))):
             symbols.append(sym)
-    # de-dup
     seen = set()
     out = []
     for s in symbols:
@@ -128,12 +228,12 @@ async def bingx_get_klines(symbol: str, interval: str, limit: int = 220):
         return await asyncio.to_thread(bingx_get_klines_sync, symbol, interval, limit)
 
 async def bingx_get_last_price(symbol: str) -> float:
-    # Лёгкий способ без отдельного тикер-эндпоинта: 1m свечи (2 штуки)
-    h, l, c, v = await bingx_get_klines(symbol, "1m", limit=2)
+    _, _, c, _ = await bingx_get_klines(symbol, "1m", 2)
     return float(c[-1])
 
+
 # ==========================
-# INDICATORS
+# Indicators
 # ==========================
 def ema(arr: np.ndarray, period: int) -> np.ndarray:
     if period <= 1:
@@ -189,31 +289,6 @@ def slope_direction(closes: np.ndarray, lookback: int = 30) -> str:
         return "bear"
     return "range"
 
-# ==========================
-# PRO A: MTF + SCORING
-# ==========================
-def ema_stack_ok(price: float, e20: float, e50: float, e200: float, direction: str) -> bool:
-    if direction == "LONG":
-        return price > e20 > e50 > e200
-    return price < e20 < e50 < e200
-
-def late_entry_filter(price: float, e20: float, r: float, direction: str) -> bool:
-    # True = OK, False = поздно / перегрето
-    if math.isnan(r):
-        return False
-    dist = (price - e20) / e20 if e20 != 0 else 0.0
-    if direction == "LONG":
-        if r > 70:
-            return False
-        if dist > 0.03:  # >3% выше EMA20 — поздно
-            return False
-    else:
-        if r < 30:
-            return False
-        if dist < -0.03:  # >3% ниже EMA20
-            return False
-    return True
-
 def calc_vol_spike(volumes: np.ndarray, window: int = 50) -> float:
     if len(volumes) < 10:
         return 0.0
@@ -223,21 +298,42 @@ def calc_vol_spike(volumes: np.ndarray, window: int = 50) -> float:
         return 0.0
     return v_last / base
 
-def build_signal(symbol: str, direction: str, tf: str, price: float, a: float) -> dict:
+def ema_stack_ok(price: float, e20: float, e50: float, e200: float, direction: str) -> bool:
+    if direction == "LONG":
+        return price > e20 > e50 > e200
+    return price < e20 < e50 < e200
+
+def late_entry_ok(price: float, e20: float, r: float, direction: str) -> bool:
+    if math.isnan(r):
+        return False
+    dist = (price - e20) / e20 if e20 else 0.0
+    if direction == "LONG":
+        if r > 70:
+            return False
+        if dist > 0.03:
+            return False
+    else:
+        if r < 30:
+            return False
+        if dist < -0.03:
+            return False
+    return True
+
+def build_signal(symbol: str, direction: str, tf: str, price: float, a: float, sl_mult: float, tp2_r: float) -> dict:
     if math.isnan(a) or a <= 0:
-        a = price * 0.006  # fallback 0.6%
-    risk = a * SL_ATR_MULT
+        a = price * 0.006
+    risk = a * sl_mult
 
     entry = price
     if direction == "LONG":
         sl = entry - risk
         tp1 = entry + risk * TP1_R
-        tp2 = entry + risk * TP2_R
+        tp2 = entry + risk * tp2_r
         tp3 = entry + risk * TP3_R
     else:
         sl = entry + risk
         tp1 = entry - risk * TP1_R
-        tp2 = entry - risk * TP2_R
+        tp2 = entry - risk * tp2_r
         tp3 = entry - risk * TP3_R
 
     return {
@@ -249,22 +345,22 @@ def build_signal(symbol: str, direction: str, tf: str, price: float, a: float) -
         "tp1": float(tp1),
         "tp2": float(tp2),
         "tp3": float(tp3),
-        "created_at": time.time(),
+        "created_at": now(),
         "status": "OPEN",
     }
 
 def format_signal(sig: dict, extras: dict) -> str:
-    # extras may include score, rsi, ema stack, vol_spike, etc.
-    score = extras.get("score", 0)
+    score = extras.get("score", 0.0)
     rsi_v = extras.get("rsi", None)
     vol_spike = extras.get("vol_spike", None)
+    mtf = extras.get("mtf", "")
 
-    rsi_txt = f"{rsi_v:.1f}" if isinstance(rsi_v, (int, float)) and not math.isnan(float(rsi_v)) else "n/a"
-    vs_txt = f"{vol_spike:.2f}x" if isinstance(vol_spike, (int, float)) else "n/a"
+    rsi_txt = f"{float(rsi_v):.1f}" if isinstance(rsi_v, (int, float)) and not math.isnan(float(rsi_v)) else "n/a"
+    vs_txt = f"{float(vol_spike):.2f}x" if isinstance(vol_spike, (int, float)) else "n/a"
 
     return (
         f"🚨 <b>{sig['symbol']}</b> — <b>{sig['direction']}</b>\n"
-        f"⏱ <b>{sig['tf']}</b> | 🔥 <b>{score:.0f}%</b>\n\n"
+        f"🧠 MTF: <b>{mtf}</b> | 🔥 <b>{score:.0f}%</b>\n\n"
         f"🎯 Entry: <code>{sig['entry']:.6g}</code>\n"
         f"🛑 SL: <code>{sig['sl']:.6g}</code>\n"
         f"🎯 TP1: <code>{sig['tp1']:.6g}</code>\n"
@@ -274,222 +370,210 @@ def format_signal(sig: dict, extras: dict) -> str:
         f"⚠️ Не финсовет."
     )
 
-def should_skip_repeat(symbol: str) -> bool:
-    last = LAST_SENT_AT.get(symbol, 0.0)
-    return (time.time() - last) < NO_REPEAT_SEC
 
 # ==========================
-# LIQUIDITY (self-learning)
+# Liquidity selection
 # ==========================
 def select_top_symbols(all_symbols: list[str]) -> list[str]:
-    # если ещё нет LIQ_SCORE — берём первые TOP_N_TARGET (быстрый старт)
     if not LIQ_SCORE:
         return all_symbols[:TOP_N_TARGET]
-
     ranked = sorted(all_symbols, key=lambda s: LIQ_SCORE.get(s, 0.0), reverse=True)
     return ranked[:TOP_N_TARGET]
 
+
 # ==========================
-# MARKET SCAN (PRO A)
+# PRO Scan core
 # ==========================
-async def analyze_symbol_pro_a(symbol: str) -> tuple[dict, dict] | None:
-    """
-    PRO A MTF:
-    - 4H trend filter
-    - 1H trend confirm
-    - 15m entry trigger
-    """
+async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None:
+    c = cfg_get(owner_id)
+    preset = MTF_PRESETS[c["mtf"]]
+    htf, mid, ltf = preset["htf"], preset["mid"], preset["ltf"]
+
     try:
-        h4_h, h4_l, h4_c, h4_v = await bingx_get_klines(symbol, "4h", 220)
-        h1_h, h1_l, h1_c, h1_v = await bingx_get_klines(symbol, "1h", 220)
-        m15_h, m15_l, m15_c, m15_v = await bingx_get_klines(symbol, "15m", 220)
+        h_h, h_l, h_c, _ = await bingx_get_klines(symbol, htf, 220)
+        m_h, m_l, m_c, _ = await bingx_get_klines(symbol, mid, 220)
+        l_h, l_l, l_c, l_v = await bingx_get_klines(symbol, ltf, 220)
 
-        price = float(m15_c[-1])
+        price = float(l_c[-1])
 
-        # Liquidity update (rough): sum last 96x15m volumes (~24h)
-        liq = float(np.sum(m15_v[-96:])) if len(m15_v) >= 96 else float(np.sum(m15_v))
-        # EMA/RSI/ATR on each TF
-        def tf_pack(closes):
+        # Liquidity score: sum last ~24h on LTF
+        # (для 15m: 96 свечей, для 5m: 288, для 1h: 24)
+        approx_24h = {"5m": 288, "15m": 96, "1h": 24, "4h": 6}.get(ltf, 96)
+        liq = float(np.sum(l_v[-approx_24h:])) if len(l_v) >= approx_24h else float(np.sum(l_v))
+        LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+
+        def pack(closes):
             e20 = float(ema(closes, 20)[-1])
             e50 = float(ema(closes, 50)[-1])
             e200 = float(ema(closes, 200)[-1]) if len(closes) >= 200 else float(ema(closes, 100)[-1])
             return e20, e50, e200
 
-        h4_e20, h4_e50, h4_e200 = tf_pack(h4_c)
-        h1_e20, h1_e50, h1_e200 = tf_pack(h1_c)
-        m15_e20, m15_e50, m15_e200 = tf_pack(m15_c)
+        h_e20, h_e50, h_e200 = pack(h_c)
+        m_e20, m_e50, m_e200 = pack(m_c)
+        l_e20, l_e50, _ = pack(l_c)
 
-        h4_struct = slope_direction(h4_c, 40)
-        h1_struct = slope_direction(h1_c, 40)
+        h_struct = slope_direction(h_c, 40)
+        m_struct = slope_direction(m_c, 40)
 
-        # decide direction by strict EMA stack on BOTH 4H and 1H
-        long_ok_htf = ema_stack_ok(float(h4_c[-1]), h4_e20, h4_e50, h4_e200, "LONG") and (h4_struct == "bull")
-        long_ok_h1  = ema_stack_ok(float(h1_c[-1]), h1_e20, h1_e50, h1_e200, "LONG") and (h1_struct == "bull")
+        # direction by strict stack on HTF & MID
+        long_ok = ema_stack_ok(float(h_c[-1]), h_e20, h_e50, h_e200, "LONG") and (h_struct == "bull") \
+                  and ema_stack_ok(float(m_c[-1]), m_e20, m_e50, m_e200, "LONG") and (m_struct == "bull")
 
-        short_ok_htf = ema_stack_ok(float(h4_c[-1]), h4_e20, h4_e50, h4_e200, "SHORT") and (h4_struct == "bear")
-        short_ok_h1  = ema_stack_ok(float(h1_c[-1]), h1_e20, h1_e50, h1_e200, "SHORT") and (h1_struct == "bear")
+        short_ok = ema_stack_ok(float(h_c[-1]), h_e20, h_e50, h_e200, "SHORT") and (h_struct == "bear") \
+                   and ema_stack_ok(float(m_c[-1]), m_e20, m_e50, m_e200, "SHORT") and (m_struct == "bear")
 
-        direction = None
-        if long_ok_htf and long_ok_h1:
-            direction = "LONG"
-        elif short_ok_htf and short_ok_h1:
-            direction = "SHORT"
-        else:
-            # нет MTF согласия
-            LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+        direction = "LONG" if long_ok else "SHORT" if short_ok else None
+        if not direction:
             return None
 
-        # 15m trigger filters
-        r15 = float(rsi(m15_c, 14))
-        a15 = float(atr(m15_h, m15_l, m15_c, 14))
-        vs15 = calc_vol_spike(m15_v, 50)
+        r = float(rsi(l_c, 14))
+        a = float(atr(l_h, l_l, l_c, 14))
+        vs = calc_vol_spike(l_v, 50)
 
-        # RSI zone strict
+        # strictness tuning
+        strict = c["strictness"]
+        min_score = c["min_score"]
+        min_vs = c["min_vol_spike"]
+        rLmin, rLmax = c["rsi_long_min"], c["rsi_long_max"]
+        rSmin, rSmax = c["rsi_short_min"], c["rsi_short_max"]
+
+        if strict == "ULTRA":
+            min_score = max(min_score, 94.0)
+            min_vs = max(min_vs, 1.50)
+        elif strict == "SOFT":
+            min_score = min(min_score, 86.0)
+            min_vs = min(min_vs, 1.15)
+
+        # RSI filter
         if direction == "LONG":
-            if not (RSI_LONG_MIN <= r15 <= RSI_LONG_MAX):
-                LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+            if not (rLmin <= r <= rLmax):
                 return None
         else:
-            if not (RSI_SHORT_MIN <= r15 <= RSI_SHORT_MAX):
-                LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+            if not (rSmin <= r <= rSmax):
                 return None
 
         # Volume spike
-        if vs15 < MIN_VOL_SPIKE:
-            LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+        if vs < min_vs:
             return None
 
-        # EMA stack on 15m тоже должен быть в сторону тренда (но мягче: цена и e20/e50)
+        # LTF alignment
         if direction == "LONG":
-            if not (price > m15_e20 > m15_e50):
-                LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+            if not (price > l_e20 > l_e50):
                 return None
         else:
-            if not (price < m15_e20 < m15_e50):
-                LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+            if not (price < l_e20 < l_e50):
                 return None
 
-        # Late entry filter
-        if not late_entry_filter(price, m15_e20, r15, direction):
-            LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+        # Late-entry
+        if not late_entry_ok(price, l_e20, r, direction):
             return None
 
-        # Score (простая, но строгая)
+        # Score
         score = 0.0
         score += 35.0  # MTF agreement base
-        score += 20.0  # strict ema stack 4h/1h already satisfied
-        score += 15.0  # 15m alignment satisfied
-        score += min(15.0, (vs15 - 1.0) * 10.0)  # spike bonus
+        score += 20.0  # strict stacks already satisfied
+        score += 15.0  # LTF alignment
+        score += min(15.0, (vs - 1.0) * 10.0)  # spike bonus
         # RSI center bonus
         if direction == "LONG":
-            score += max(0.0, 10.0 - abs(r15 - 58.0))
+            score += max(0.0, 10.0 - abs(r - 58.0))
         else:
-            score += max(0.0, 10.0 - abs(r15 - 42.0))
-        # ATR sanity
-        if not math.isnan(a15) and a15 > 0:
+            score += max(0.0, 10.0 - abs(r - 42.0))
+        if not math.isnan(a) and a > 0:
             score += 5.0
-
-        # clamp
         score = max(0.0, min(100.0, score))
 
-        if score < MIN_SCORE:
-            LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
+        if score < min_score:
             return None
 
-        # Build signal
-        sig = build_signal(symbol, direction, "15m", price, a15)
+        sig = build_signal(
+            symbol=symbol,
+            direction=direction,
+            tf=ltf,
+            price=price,
+            a=a,
+            sl_mult=c["sl_atr_mult"],
+            tp2_r=c["tp2_r"],
+        )
 
         extras = {
             "score": score,
-            "rsi": r15,
-            "vol_spike": vs15,
-            "liq": liq,
+            "rsi": r,
+            "vol_spike": vs,
+            "mtf": f"{preset['htf']}+{preset['mid']}+{preset['ltf']}",
         }
-
-        # Update liquidity score
-        LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
-
         return sig, extras
 
     except Exception:
         return None
 
-async def scan_market_and_send():
-    global LAST_LIQ_REFRESH
 
+async def scan_market_and_send():
+    global OWNER_ID
     if OWNER_ID is None:
         return
 
+    c = cfg_get(OWNER_ID)
     all_symbols = bingx_get_usdt_perpetuals()
-    symbols = select_top_symbols(all_symbols)
-
-    # анализируем ровно ROTATION_BATCH (==200)
-    batch = symbols[:ROTATION_BATCH]
+    symbols = select_top_symbols(all_symbols)[:ROTATION_BATCH]
 
     candidates: list[tuple[dict, dict]] = []
 
     async def worker(sym: str):
-        res = await analyze_symbol_pro_a(sym)
+        res = await analyze_symbol(OWNER_ID, sym)
         if res:
             candidates.append(res)
 
-    await asyncio.gather(*[worker(s) for s in batch])
+    await asyncio.gather(*[worker(s) for s in symbols])
 
     if not candidates:
         return
 
-    # сортируем по score
     candidates.sort(key=lambda x: x[1].get("score", 0.0), reverse=True)
 
-    # отправляем максимум 1 сигнал за скан (PRO A, без спама)
+    # PRO A: max 1 signal per scan
     for sig, extras in candidates:
         sym = sig["symbol"]
-
         if should_skip_repeat(sym):
             continue
-
-        # Если уже есть активный по этому символу — пропускаем
-        if sym in ACTIVE_SIGNALS and ACTIVE_SIGNALS[sym]["status"] == "OPEN":
+        if sym in ACTIVE_SIGNALS and ACTIVE_SIGNALS[sym].get("status") == "OPEN":
             continue
 
-        # лимит активных
-        open_count = sum(1 for v in ACTIVE_SIGNALS.values() if v["status"] == "OPEN")
-        if open_count >= MAX_ACTIVE_SIGNALS:
-            # заменим самый слабый только если новый сильно лучше
+        open_count = sum(1 for v in ACTIVE_SIGNALS.values() if v.get("status") == "OPEN")
+        if open_count >= c["max_active"]:
+            # Replace weakest only if much better (and ultra)
             weakest_sym = None
             weakest_score = 999.0
             for s, v in ACTIVE_SIGNALS.items():
-                if v["status"] != "OPEN":
+                if v.get("status") != "OPEN":
                     continue
                 sc = float(v.get("score", 0.0))
                 if sc < weakest_score:
                     weakest_score = sc
                     weakest_sym = s
-            if weakest_sym and extras.get("score", 0.0) >= weakest_score + 5.0 and extras.get("score", 0.0) >= 94.0:
-                # закрываем слабый
+            if weakest_sym and float(extras.get("score", 0.0)) >= weakest_score + 5.0 and float(extras.get("score", 0.0)) >= 94.0:
                 ACTIVE_SIGNALS[weakest_sym]["status"] = "REPLACED"
             else:
                 continue
 
-        # сохраняем и отправляем
         sig_record = sig.copy()
         sig_record["score"] = float(extras.get("score", 0.0))
         sig_record["rsi"] = float(extras.get("rsi", 0.0))
         sig_record["vol_spike"] = float(extras.get("vol_spike", 0.0))
-        sig_record["last_update"] = time.time()
+        sig_record["mtf"] = extras.get("mtf", "")
+        sig_record["last_update"] = now()
 
         ACTIVE_SIGNALS[sym] = sig_record
-        LAST_SENT_AT[sym] = time.time()
+        LAST_SENT_AT[sym] = now()
 
-        text = format_signal(sig_record, extras)
-        await bot.send_message(OWNER_ID, text)
+        await bot.send_message(OWNER_ID, format_signal(sig_record, extras))
         break
+
 
 async def update_active_signals():
     if OWNER_ID is None:
         return
 
-    # обновляем только OPEN и максимум 2 — это легко
     for sym, sig in list(ACTIVE_SIGNALS.items()):
         if sig.get("status") != "OPEN":
             continue
@@ -505,60 +589,63 @@ async def update_active_signals():
         tp2 = float(sig["tp2"])
         tp3 = float(sig["tp3"])
 
-        # уже отмеченные цели
         hit1 = bool(sig.get("hit_tp1", False))
         hit2 = bool(sig.get("hit_tp2", False))
         hit3 = bool(sig.get("hit_tp3", False))
 
-        def send(msg: str):
-            return bot.send_message(OWNER_ID, msg)
+        async def send(msg: str):
+            if OWNER_ID is not None:
+                await bot.send_message(OWNER_ID, msg)
 
-        # SL / TP checks
         if direction == "LONG":
             if price <= sl:
                 sig["status"] = "SL"
-                await send(f"🛑 <b>{sym}</b> — SL сработал. Цена: <code>{price:.6g}</code>")
+                await send(f"🛑 <b>{sym}</b> — SL. Цена: <code>{price:.6g}</code>")
                 continue
             if (not hit1) and price >= tp1:
                 sig["hit_tp1"] = True
-                await send(f"✅ <b>{sym}</b> — TP1 достигнут. Цена: <code>{price:.6g}</code>")
+                await send(f"✅ <b>{sym}</b> — TP1. Цена: <code>{price:.6g}</code>")
             if (not hit2) and price >= tp2:
                 sig["hit_tp2"] = True
-                await send(f"✅ <b>{sym}</b> — TP2 достигнут. Цена: <code>{price:.6g}</code>")
+                await send(f"✅ <b>{sym}</b> — TP2. Цена: <code>{price:.6g}</code>")
             if (not hit3) and price >= tp3:
                 sig["hit_tp3"] = True
                 sig["status"] = "TP3"
-                await send(f"🏁 <b>{sym}</b> — TP3 достигнут. Сделка закрыта. Цена: <code>{price:.6g}</code>")
+                await send(f"🏁 <b>{sym}</b> — TP3. Закрыто. Цена: <code>{price:.6g}</code>")
         else:
             if price >= sl:
                 sig["status"] = "SL"
-                await send(f"🛑 <b>{sym}</b> — SL сработал. Цена: <code>{price:.6g}</code>")
+                await send(f"🛑 <b>{sym}</b> — SL. Цена: <code>{price:.6g}</code>")
                 continue
             if (not hit1) and price <= tp1:
                 sig["hit_tp1"] = True
-                await send(f"✅ <b>{sym}</b> — TP1 достигнут. Цена: <code>{price:.6g}</code>")
+                await send(f"✅ <b>{sym}</b> — TP1. Цена: <code>{price:.6g}</code>")
             if (not hit2) and price <= tp2:
                 sig["hit_tp2"] = True
-                await send(f"✅ <b>{sym}</b> — TP2 достигнут. Цена: <code>{price:.6g}</code>")
+                await send(f"✅ <b>{sym}</b> — TP2. Цена: <code>{price:.6g}</code>")
             if (not hit3) and price <= tp3:
                 sig["hit_tp3"] = True
                 sig["status"] = "TP3"
-                await send(f"🏁 <b>{sym}</b> — TP3 достигнут. Сделка закрыта. Цена: <code>{price:.6g}</code>")
+                await send(f"🏁 <b>{sym}</b> — TP3. Закрыто. Цена: <code>{price:.6g}</code>")
 
-        sig["last_update"] = time.time()
+        sig["last_update"] = now()
+
 
 # ==========================
-# BACKGROUND LOOPS
+# BACKGROUND TASKS
 # ==========================
 async def scanner_loop():
-    # маленькая задержка после старта
     await asyncio.sleep(3)
     while True:
         try:
+            if OWNER_ID is not None:
+                interval = int(cfg_get(OWNER_ID)["scan_interval_sec"])
+            else:
+                interval = SCAN_INTERVAL_SEC_DEFAULT
             await scan_market_and_send()
         except Exception:
             pass
-        await asyncio.sleep(SCAN_INTERVAL_SEC)
+        await asyncio.sleep(interval)
 
 async def updater_loop():
     await asyncio.sleep(5)
@@ -569,69 +656,185 @@ async def updater_loop():
             pass
         await asyncio.sleep(UPDATE_INTERVAL_SEC)
 
+
 # ==========================
-# TELEGRAM COMMANDS
+# TELEGRAM: /start
 # ==========================
 @dp.message(F.text == "/start")
 async def start(message: Message):
-    await message.answer(
-        "🤖 BingX PRO A Signals\n\n"
-        "Команды:\n"
-        "• /setme — назначить меня владельцем (куда слать сигналы)\n"
-        "• /bingxtest — тест BingX\n"
-        "• /active — активные сигналы\n"
-        "• /forcescan — принудительно просканировать сейчас\n\n"
+    text = (
+        "🤖 <b>BingX PRO Signals</b>\n\n"
+        "Управление — кнопками ниже.\n"
         "Режим: <b>PRO A</b> (мало сигналов, максимально точные)"
     )
+    await message.answer(text, reply_markup=kb_main())
 
-@dp.message(F.text == "/setme")
-async def setme(message: Message):
+
+# ==========================
+# CALLBACKS
+# ==========================
+@dp.callback_query(F.data == "back_main")
+async def back_main(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "🤖 <b>BingX PRO Signals</b>\n\nВыбери действие:",
+        reply_markup=kb_main()
+    )
+    await cb.answer()
+
+@dp.callback_query(F.data == "set_owner")
+async def set_owner(cb: CallbackQuery):
     global OWNER_ID
-    OWNER_ID = message.from_user.id
-    await message.answer("✅ Готово. Теперь авто-сигналы будут приходить сюда.")
+    OWNER_ID = cb.from_user.id
+    cfg_get(OWNER_ID)  # init defaults
+    await cb.message.edit_text(
+        "✅ Готово. Теперь авто-сигналы будут приходить сюда.\n\n"
+        "Можешь нажать «⚡ Сканировать сейчас» для проверки.",
+        reply_markup=kb_main()
+    )
+    await cb.answer("Владелец назначен ✅")
 
-@dp.message(F.text == "/bingxtest")
-async def bingx_test(message: Message):
+@dp.callback_query(F.data == "bingx_test")
+async def bingx_test(cb: CallbackQuery):
     try:
         syms = bingx_get_usdt_perpetuals()
         sample = syms[:5]
-        h, l, c, v = bingx_get_klines_sync(sample[0], interval="1h", limit=200)
-        await message.answer(
-            "✅ BingX подключён\n\n"
-            f"Контрактов найдено: <b>{len(syms)}</b>\n"
+        _, _, c, _ = bingx_get_klines_sync(sample[0], "1h", 200)
+        await cb.message.edit_text(
+            "✅ <b>BingX подключён</b>\n\n"
+            f"Контрактов: <b>{len(syms)}</b>\n"
             f"Пример: <code>{', '.join(sample)}</code>\n"
-            f"Свечей по <code>{sample[0]}</code> (1h): <b>{len(c)}</b>"
+            f"Свечей по <code>{sample[0]}</code> (1h): <b>{len(c)}</b>\n\n"
+            "⬅️ Вернуться в меню — кнопкой ниже.",
+            reply_markup=kb_main()
         )
     except Exception as e:
-        await message.answer(f"❌ Ошибка BingX: <code>{type(e).__name__}: {str(e)[:400]}</code>")
+        await cb.message.edit_text(
+            f"❌ Ошибка BingX: <code>{type(e).__name__}: {str(e)[:300]}</code>",
+            reply_markup=kb_main()
+        )
+    await cb.answer()
 
-@dp.message(F.text == "/active")
-async def active(message: Message):
+@dp.callback_query(F.data == "force_scan")
+async def force_scan(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала назначь владельца 👑", show_alert=True)
+        return
+    await cb.answer("Сканирую…")
+    await bot.send_message(OWNER_ID, "⏳ Сканирую рынок (PRO)…")
+    await scan_market_and_send()
+    await bot.send_message(OWNER_ID, "✅ Готово. Если был ultra-сетап — я отправил сигнал.")
+
+@dp.callback_query(F.data == "show_active")
+async def show_active(cb: CallbackQuery):
     open_items = [v for v in ACTIVE_SIGNALS.values() if v.get("status") == "OPEN"]
     if not open_items:
-        await message.answer("Пока нет активных сигналов.")
+        await cb.message.edit_text("Пока нет активных сигналов.", reply_markup=kb_main())
+        await cb.answer()
         return
+
     lines = ["📌 <b>Активные сигналы</b>:\n"]
     for s in open_items:
         lines.append(
             f"• <b>{s['symbol']}</b> {s['direction']} | score <b>{float(s.get('score',0)):.0f}%</b>\n"
             f"  Entry <code>{s['entry']:.6g}</code> | SL <code>{s['sl']:.6g}</code>\n"
-            f"  TP1 <code>{s['tp1']:.6g}</code> TP2 <code>{s['tp2']:.6g}</code> TP3 <code>{s['tp3']:.6g}</code>"
+            f"  TP1 <code>{s['tp1']:.6g}</code>  TP2 <code>{s['tp2']:.6g}</code>  TP3 <code>{s['tp3']:.6g}</code>"
         )
-    await message.answer("\n".join(lines))
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb_main())
+    await cb.answer()
 
-@dp.message(F.text == "/forcescan")
-async def forcescan(message: Message):
-    await message.answer("⏳ Сканирую сейчас (PRO A)…")
-    await scan_market_and_send()
-    await message.answer("✅ Готово. Если был найден ultra-сетап — я отправил его.")
+@dp.callback_query(F.data == "settings")
+async def settings(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала назначь владельца 👑", show_alert=True)
+        return
+    await cb.message.edit_text("⚙️ <b>Настройки PRO</b>\nВыбери что менять:", reply_markup=kb_settings(OWNER_ID))
+    await cb.answer()
+
+@dp.callback_query(F.data == "set_scan_interval")
+async def set_scan_interval(cb: CallbackQuery):
+    await cb.message.edit_text("⏱ Выбери частоту скана:", reply_markup=kb_pick_scan_interval())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("scanint:"))
+async def pick_scan_interval(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала /start", show_alert=True)
+        return
+    val = int(cb.data.split(":")[1])
+    cfg_get(OWNER_ID)["scan_interval_sec"] = val
+    await cb.message.edit_text("✅ Частота скана обновлена.", reply_markup=kb_settings(OWNER_ID))
+    await cb.answer("Готово ✅")
+
+@dp.callback_query(F.data == "set_max_active")
+async def set_max_active(cb: CallbackQuery):
+    await cb.message.edit_text("📌 Макс активных сигналов:", reply_markup=kb_pick_max_active())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("maxact:"))
+async def pick_max_active(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала /start", show_alert=True)
+        return
+    val = int(cb.data.split(":")[1])
+    cfg_get(OWNER_ID)["max_active"] = val
+    await cb.message.edit_text("✅ Лимит активных обновлён.", reply_markup=kb_settings(OWNER_ID))
+    await cb.answer("Готово ✅")
+
+@dp.callback_query(F.data == "set_strictness")
+async def set_strictness(cb: CallbackQuery):
+    await cb.message.edit_text("🎯 Выбери строгость:", reply_markup=kb_pick_strictness())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("strict:"))
+async def pick_strictness(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала /start", show_alert=True)
+        return
+    val = cb.data.split(":")[1]
+    cfg = cfg_get(OWNER_ID)
+    cfg["strictness"] = val
+
+    # tune thresholds by strictness
+    if val == "ULTRA":
+        cfg["min_score"] = 94.0
+        cfg["min_vol_spike"] = 1.50
+        cfg["tp2_r"] = 3.0
+    elif val == "SOFT":
+        cfg["min_score"] = 86.0
+        cfg["min_vol_spike"] = 1.15
+        cfg["tp2_r"] = 2.2
+    else:  # PRO_A
+        cfg["min_score"] = 90.0
+        cfg["min_vol_spike"] = 1.30
+        cfg["tp2_r"] = 2.5
+
+    await cb.message.edit_text("✅ Строгость применена.", reply_markup=kb_settings(OWNER_ID))
+    await cb.answer("Ок ✅")
+
+@dp.callback_query(F.data == "set_mtf")
+async def set_mtf(cb: CallbackQuery):
+    await cb.message.edit_text("🧠 Выбери MTF пресет:", reply_markup=kb_pick_mtf())
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("mtf:"))
+async def pick_mtf(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала /start", show_alert=True)
+        return
+    val = cb.data.split(":")[1]
+    if val not in MTF_PRESETS:
+        await cb.answer("Неизвестный пресет", show_alert=True)
+        return
+    cfg_get(OWNER_ID)["mtf"] = val
+    await cb.message.edit_text("✅ MTF пресет обновлён.", reply_markup=kb_settings(OWNER_ID))
+    await cb.answer("Готово ✅")
+
 
 # ==========================
 # MAIN
 # ==========================
 async def main():
     print("✅ Bot is starting polling...")
-    # запускаем фоновые задачи
     asyncio.create_task(scanner_loop())
     asyncio.create_task(updater_loop())
     await dp.start_polling(bot)
