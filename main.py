@@ -92,6 +92,7 @@ def cfg_get(owner_id: int) -> dict:
             "tp2_r": TP2_R_DEFAULT,
             "mtf": "proA",  # preset key
             "strictness": "PRO_A",  # ULTRA / PRO_A / SOFT
+            "autoscan_enabled": True,  # ✅ NEW
         }
     return USER_CFG[owner_id]
 
@@ -108,26 +109,40 @@ def should_skip_repeat(symbol: str) -> bool:
 # ==========================
 def kb_main():
     kb = InlineKeyboardBuilder()
+
     kb.button(text="👑 Назначить меня владельцем", callback_data="set_owner")
+
+    # ✅ autoscan toggle button (shows current state)
+    if OWNER_ID is not None:
+        enabled = bool(cfg_get(OWNER_ID).get("autoscan_enabled", True))
+        kb.button(text=f"⏯ Автоскан: {'ON ✅' if enabled else 'OFF ⛔'}", callback_data="toggle_autoscan")
+    else:
+        kb.button(text="⏯ Автоскан: (нужен владелец)", callback_data="set_owner")
+
     kb.button(text="⚡ Сканировать сейчас", callback_data="force_scan")
     kb.button(text="📌 Активные сигналы", callback_data="show_active")
     kb.button(text="⚙️ Настройки PRO", callback_data="settings")
     kb.button(text="✅ Тест BingX", callback_data="bingx_test")
-    kb.adjust(1, 2, 2)
+
+    kb.adjust(1, 1, 2, 2)
     return kb.as_markup()
 
 def kb_settings(owner_id: int):
     c = cfg_get(owner_id)
     kb = InlineKeyboardBuilder()
 
+    kb.button(text=f"⏯ Автоскан: {'ON ✅' if c['autoscan_enabled'] else 'OFF ⛔'}", callback_data="toggle_autoscan")
     kb.button(text=f"⏱ Частота скана: {int(c['scan_interval_sec']/60)}м", callback_data="set_scan_interval")
     kb.button(text=f"📌 Макс активных: {c['max_active']}", callback_data="set_max_active")
 
     kb.button(text=f"🎯 Строгость: {c['strictness']}", callback_data="set_strictness")
-    kb.button(text=f"🧠 MTF: {c['mtf']} ({MTF_PRESETS[c['mtf']]['htf']}+{MTF_PRESETS[c['mtf']]['mid']}+{MTF_PRESETS[c['mtf']]['ltf']})", callback_data="set_mtf")
+    kb.button(
+        text=f"🧠 MTF: {c['mtf']} ({MTF_PRESETS[c['mtf']]['htf']}+{MTF_PRESETS[c['mtf']]['mid']}+{MTF_PRESETS[c['mtf']]['ltf']})",
+        callback_data="set_mtf",
+    )
 
     kb.button(text="⬅️ Назад", callback_data="back_main")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 def kb_pick_scan_interval():
@@ -396,8 +411,6 @@ async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None
 
         price = float(l_c[-1])
 
-        # Liquidity score: sum last ~24h on LTF
-        # (для 15m: 96 свечей, для 5m: 288, для 1h: 24)
         approx_24h = {"5m": 288, "15m": 96, "1h": 24, "4h": 6}.get(ltf, 96)
         liq = float(np.sum(l_v[-approx_24h:])) if len(l_v) >= approx_24h else float(np.sum(l_v))
         LIQ_SCORE[symbol] = max(LIQ_SCORE.get(symbol, 0.0), liq)
@@ -415,7 +428,6 @@ async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None
         h_struct = slope_direction(h_c, 40)
         m_struct = slope_direction(m_c, 40)
 
-        # direction by strict stack on HTF & MID
         long_ok = ema_stack_ok(float(h_c[-1]), h_e20, h_e50, h_e200, "LONG") and (h_struct == "bull") \
                   and ema_stack_ok(float(m_c[-1]), m_e20, m_e50, m_e200, "LONG") and (m_struct == "bull")
 
@@ -430,7 +442,6 @@ async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None
         a = float(atr(l_h, l_l, l_c, 14))
         vs = calc_vol_spike(l_v, 50)
 
-        # strictness tuning
         strict = c["strictness"]
         min_score = c["min_score"]
         min_vs = c["min_vol_spike"]
@@ -444,7 +455,6 @@ async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None
             min_score = min(min_score, 86.0)
             min_vs = min(min_vs, 1.15)
 
-        # RSI filter
         if direction == "LONG":
             if not (rLmin <= r <= rLmax):
                 return None
@@ -452,11 +462,9 @@ async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None
             if not (rSmin <= r <= rSmax):
                 return None
 
-        # Volume spike
         if vs < min_vs:
             return None
 
-        # LTF alignment
         if direction == "LONG":
             if not (price > l_e20 > l_e50):
                 return None
@@ -464,17 +472,14 @@ async def analyze_symbol(owner_id: int, symbol: str) -> tuple[dict, dict] | None
             if not (price < l_e20 < l_e50):
                 return None
 
-        # Late-entry
         if not late_entry_ok(price, l_e20, r, direction):
             return None
 
-        # Score
         score = 0.0
-        score += 35.0  # MTF agreement base
-        score += 20.0  # strict stacks already satisfied
-        score += 15.0  # LTF alignment
-        score += min(15.0, (vs - 1.0) * 10.0)  # spike bonus
-        # RSI center bonus
+        score += 35.0
+        score += 20.0
+        score += 15.0
+        score += min(15.0, (vs - 1.0) * 10.0)
         if direction == "LONG":
             score += max(0.0, 10.0 - abs(r - 58.0))
         else:
@@ -531,7 +536,6 @@ async def scan_market_and_send():
 
     candidates.sort(key=lambda x: x[1].get("score", 0.0), reverse=True)
 
-    # PRO A: max 1 signal per scan
     for sig, extras in candidates:
         sym = sig["symbol"]
         if should_skip_repeat(sym):
@@ -541,7 +545,6 @@ async def scan_market_and_send():
 
         open_count = sum(1 for v in ACTIVE_SIGNALS.values() if v.get("status") == "OPEN")
         if open_count >= c["max_active"]:
-            # Replace weakest only if much better (and ultra)
             weakest_sym = None
             weakest_score = 999.0
             for s, v in ACTIVE_SIGNALS.items():
@@ -639,13 +642,26 @@ async def scanner_loop():
     while True:
         try:
             if OWNER_ID is not None:
-                interval = int(cfg_get(OWNER_ID)["scan_interval_sec"])
+                c = cfg_get(OWNER_ID)
+                interval = int(c["scan_interval_sec"])
+
+                # ✅ if autoscan disabled — skip scanning
+                if not bool(c.get("autoscan_enabled", True)):
+                    await asyncio.sleep(interval)
+                    continue
+
+                await scan_market_and_send()
             else:
-                interval = SCAN_INTERVAL_SEC_DEFAULT
-            await scan_market_and_send()
+                await asyncio.sleep(SCAN_INTERVAL_SEC_DEFAULT)
+                continue
         except Exception:
             pass
-        await asyncio.sleep(interval)
+
+        # normal sleep
+        if OWNER_ID is not None:
+            await asyncio.sleep(int(cfg_get(OWNER_ID)["scan_interval_sec"]))
+        else:
+            await asyncio.sleep(SCAN_INTERVAL_SEC_DEFAULT)
 
 async def updater_loop():
     await asyncio.sleep(5)
@@ -692,6 +708,29 @@ async def set_owner(cb: CallbackQuery):
         reply_markup=kb_main()
     )
     await cb.answer("Владелец назначен ✅")
+
+@dp.callback_query(F.data == "toggle_autoscan")
+async def toggle_autoscan(cb: CallbackQuery):
+    if OWNER_ID is None:
+        await cb.answer("Сначала назначь владельца 👑", show_alert=True)
+        return
+
+    c = cfg_get(OWNER_ID)
+    c["autoscan_enabled"] = not bool(c.get("autoscan_enabled", True))
+
+    state = "ON ✅" if c["autoscan_enabled"] else "OFF ⛔"
+    await cb.answer(f"Автоскан: {state}")
+
+    # обновим экран — если пользователь в настройках, вернем туда; иначе в меню
+    text = cb.message.text or ""
+    if "Настройки" in text:
+        await cb.message.edit_text("⚙️ <b>Настройки PRO</b>\nВыбери что менять:", reply_markup=kb_settings(OWNER_ID))
+    else:
+        await cb.message.edit_text("🤖 <b>BingX PRO Signals</b>\n\nВыбери действие:", reply_markup=kb_main())
+
+    # опционально уведомление
+    if OWNER_ID is not None:
+        await bot.send_message(OWNER_ID, f"⏯ Автоскан переключён: <b>{state}</b>")
 
 @dp.callback_query(F.data == "bingx_test")
 async def bingx_test(cb: CallbackQuery):
@@ -794,7 +833,6 @@ async def pick_strictness(cb: CallbackQuery):
     cfg = cfg_get(OWNER_ID)
     cfg["strictness"] = val
 
-    # tune thresholds by strictness
     if val == "ULTRA":
         cfg["min_score"] = 94.0
         cfg["min_vol_spike"] = 1.50
